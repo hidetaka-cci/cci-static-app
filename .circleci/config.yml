@@ -56,13 +56,26 @@ jobs:
     steps:
       - checkout
       - run:
-          name: Download artifact from current build
+          name: Download artifact from build job
           command: |
             # CIRCLE_PROJECT_SLUGを構築（GitHubの場合はgh/org/repo形式）
             CIRCLE_PROJECT_SLUG="gh/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
             
-            # 同じビルドナンバーのアーティファクトをダウンロード
-            ARTIFACTS_URL="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/${CIRCLE_BUILD_NUM}/artifacts"
+            # 同じワークフロー内のbuildジョブのジョブ番号を取得
+            WORKFLOW_API="https://circleci.com/api/v2/workflow/${CIRCLE_WORKFLOW_ID}/job"
+            echo "Fetching jobs from workflow: ${CIRCLE_WORKFLOW_ID}"
+            
+            BUILD_JOB_NUM=$(curl -H "Circle-Token: ${CIRCLE_TOKEN}" "${WORKFLOW_API}" \
+              | jq -r '.items[] | select(.name == "build") | .job_number')
+            
+            if [ -z "${BUILD_JOB_NUM}" ]; then
+              echo "Error: Could not find build job in workflow ${CIRCLE_WORKFLOW_ID}"
+              exit 1
+            fi
+            echo "Found build job number: ${BUILD_JOB_NUM}"
+            
+            # buildジョブのアーティファクトをダウンロード
+            ARTIFACTS_URL="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/${BUILD_JOB_NUM}/artifacts"
             echo "Fetching artifacts from: ${ARTIFACTS_URL}"
             
             ARTIFACTS_JSON=$(curl -L -H "Circle-Token: ${CIRCLE_TOKEN}" "${ARTIFACTS_URL}")
