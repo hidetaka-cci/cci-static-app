@@ -34,12 +34,14 @@ jobs:
             git config --global user.email "circleci-bot@example.com"
             git config --global user.name "circleci-bot"
             
-            # gh-pagesのキャッシュをクリア
-            rm -rf node_modules/.cache/gh-pages
-            
-            cp .nojekyll dist/.nojekyll
-            
-            npx gh-pages -d dist -r https://${GITHUB_TOKEN}@github.com/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}.git
+            git clone --depth 1 --branch gh-pages https://${GITHUB_TOKEN}@github.com/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}.git /tmp/gh-pages
+            cd /tmp/gh-pages
+            rm -rf ./*
+            cp -r ~/project/dist/* .
+            cp ~/project/.nojekyll .
+            git add -A
+            git commit -m "Deploy from CircleCI [skip ci]" || echo "No changes"
+            git push origin gh-pages
   type-check:
     docker:
       - image: cimg/node:20.0
