@@ -2,6 +2,7 @@ version: 2.1
 
 orbs:
   node: circleci/node@7.0.0
+  gh: circleci/github-cli@1.0.0
 
 jobs:
   build:
@@ -28,13 +29,17 @@ jobs:
       - checkout
       - attach_workspace:
           at: .
+      - gh/setup
+      - run:
+          name: Authenticate with GitHub
+          command: echo "${GITHUB_TOKEN}" | gh auth login --with-token
       - run:
           name: Deploy to GitHub Pages
           command: |
             git config --global user.email "circleci-bot@example.com"
             git config --global user.name "circleci-bot"
             
-            git clone --depth 1 --branch gh-pages https://${GITHUB_TOKEN}@github.com/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}.git /tmp/gh-pages
+            git clone --depth 1 --branch gh-pages https://github.com/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}.git /tmp/gh-pages
             cd /tmp/gh-pages
             rm -rf ./*
             cp -r ~/project/dist/* .
