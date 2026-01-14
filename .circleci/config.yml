@@ -58,12 +58,27 @@ jobs:
       - run:
           name: Download artifact from current build
           command: |
+            # CIRCLE_PROJECT_SLUGを構築（GitHubの場合はgh/org/repo形式）
+            CIRCLE_PROJECT_SLUG="gh/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
+            
             # 同じビルドナンバーのアーティファクトをダウンロード
             ARTIFACTS_URL="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/${CIRCLE_BUILD_NUM}/artifacts"
             echo "Fetching artifacts from: ${ARTIFACTS_URL}"
             
-            ARTIFACT_URL=$(curl -L -H "Circle-Token: ${CIRCLE_TOKEN}" "${ARTIFACTS_URL}" \
-              | jq -r '.items[] | select(.path | contains("artifact-")) | .url' | head -1)
+            ARTIFACTS_JSON=$(curl -L -H "Circle-Token: ${CIRCLE_TOKEN}" "${ARTIFACTS_URL}")
+            
+            if [ -z "${ARTIFACTS_JSON}" ] || [ "${ARTIFACTS_JSON}" = "null" ]; then
+              echo "Error: Could not fetch artifacts from API"
+              exit 1
+            fi
+            
+            ARTIFACT_URL=$(echo "${ARTIFACTS_JSON}" | jq -r '.items[]? | select(.path | contains("artifact-")) | .url' | head -1)
+            
+            if [ -z "${ARTIFACT_URL}" ] || [ "${ARTIFACT_URL}" = "null" ]; then
+              echo "Error: Could not find artifact in response"
+              echo "Response: ${ARTIFACTS_JSON}"
+              exit 1
+            fi
             
             echo "Downloading artifact from: ${ARTIFACT_URL}"
             curl -L -o artifact.zip "${ARTIFACT_URL}"
@@ -71,9 +86,14 @@ jobs:
             unzip artifact.zip -d dist
             
             # version.txtも取得
-            VERSION_URL=$(curl -L -H "Circle-Token: ${CIRCLE_TOKEN}" "${ARTIFACTS_URL}" \
-              | jq -r '.items[] | select(.path | contains("version.txt")) | .url' | head -1)
-            curl -L -o version.txt "${VERSION_URL}"
+            VERSION_URL=$(echo "${ARTIFACTS_JSON}" | jq -r '.items[]? | select(.path | contains("version.txt")) | .url' | head -1)
+            
+            if [ -z "${VERSION_URL}" ] || [ "${VERSION_URL}" = "null" ]; then
+              echo "Warning: Could not find version.txt, using current commit SHA"
+              echo ${CIRCLE_SHA1:0:7} > version.txt
+            else
+              curl -L -o version.txt "${VERSION_URL}"
+            fi
       - run:
           name: Plan deployment
           command: |
@@ -137,6 +157,9 @@ jobs:
           command: |
             TARGET_VERSION="<< parameters.target_version >>"
             echo "Promoting version: ${TARGET_VERSION}"
+            
+            # CIRCLE_PROJECT_SLUGを構築（GitHubの場合はgh/org/repo形式）
+            CIRCLE_PROJECT_SLUG="gh/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
             
             # 指定されたコミットのパイプラインIDを取得
             PIPELINE_API="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/pipeline?branch=main"
