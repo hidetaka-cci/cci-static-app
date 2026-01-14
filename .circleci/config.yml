@@ -1,0 +1,66 @@
+version: 2.1
+
+orbs:
+  node: circleci/node@7.0.0
+
+jobs:
+  build:
+    docker:
+      - image: cimg/node:20.0
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+      - run:
+          name: Build
+          command: npm run build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - dist
+
+  deploy:
+    docker:
+      - image: cimg/node:20.0
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Deploy to GitHub Pages
+          command: |
+            # gitのユーザー設定は最低限必要
+            git config --global user.email "circleci-bot@example.com"
+            git config --global user.name "circleci-bot"
+            
+            # PATを使ってリモートURLを指定してデプロイ
+            # -r オプションでトークンを含めたURLを渡すのが一番確実です
+            npx gh-pages -d dist -r https://${GITHUB_TOKEN}@github.com/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}.git
+  type-check:
+    docker:
+      - image: cimg/node:20.0
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+      - run:
+          name: Type check
+          command: npx tsc --noEmit
+
+workflows:
+  test:
+    jobs:
+      - type-check
+  build-and-deploy:
+    jobs:
+      - build:
+          filters:
+            branches:
+              only: main
+      - deploy:
+          requires:
+            - build
+          filters:
+            branches:
+              only: main
+
