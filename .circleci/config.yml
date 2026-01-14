@@ -214,4 +214,10 @@ workflows:
           filters:
             branches:
               only: main
+      - deploy-production:
+          requires:
+            - build
+          filters:
+            branches:
+              only: main
 
