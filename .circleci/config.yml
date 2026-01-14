@@ -53,79 +53,33 @@ jobs:
     resource_class: small
     steps:
       - checkout
+      - attach_workspace:
+          at: .
       - run:
-          name: Download artifact from build job
+          name: Extract artifact from workspace
           command: |
-            # CIRCLE_PROJECT_SLUGを構築（GitHubの場合はgh/org/repo形式）
-            CIRCLE_PROJECT_SLUG="gh/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
+            # workspaceからアーティファクトファイルを探す
+            ARTIFACT_FILE=$(ls artifact-*.zip 2>/dev/null | head -1)
             
-            # 同じワークフロー内のbuildジョブのジョブ番号を取得
-            WORKFLOW_API="https://circleci.com/api/v2/workflow/${CIRCLE_WORKFLOW_ID}/job"
-            echo "Fetching jobs from workflow: ${CIRCLE_WORKFLOW_ID}"
-            
-            BUILD_JOB_NUM=$(curl -H "Circle-Token: ${CIRCLE_TOKEN}" "${WORKFLOW_API}" \
-              | jq -r '.items[] | select(.name == "build") | .job_number')
-            
-            if [ -z "${BUILD_JOB_NUM}" ]; then
-              echo "Error: Could not find build job in workflow ${CIRCLE_WORKFLOW_ID}"
-              exit 1
-            fi
-            echo "Found build job number: ${BUILD_JOB_NUM}"
-            
-            # buildジョブのアーティファクトをダウンロード
-            ARTIFACTS_URL="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/${BUILD_JOB_NUM}/artifacts"
-            echo "Fetching artifacts from: ${ARTIFACTS_URL}"
-            
-            ARTIFACTS_JSON=$(curl -L -H "Circle-Token: ${CIRCLE_TOKEN}" "${ARTIFACTS_URL}")
-            
-            if [ -z "${ARTIFACTS_JSON}" ] || [ "${ARTIFACTS_JSON}" = "null" ]; then
-              echo "Error: Could not fetch artifacts from API"
+            if [ -z "${ARTIFACT_FILE}" ]; then
+              echo "Error: Could not find artifact file in workspace"
               exit 1
             fi
             
-            # アーティファクトファイルを探す（artifact-*.zip）
-            ARTIFACT_URL=$(echo "${ARTIFACTS_JSON}" | jq -r '.items[]? | select(.path | test("artifact-.*\\.zip$")) | .url' | head -1)
+            echo "Found artifact file: ${ARTIFACT_FILE}"
             
-            # 見つからない場合は、artifactsディレクトリから構築
-            if [ -z "${ARTIFACT_URL}" ] || [ "${ARTIFACT_URL}" = "null" ]; then
-              ARTIFACTS_DIR_URL=$(echo "${ARTIFACTS_JSON}" | jq -r '.items[]? | select(.path == "artifacts") | .url' | head -1)
-              if [ -n "${ARTIFACTS_DIR_URL}" ] && [ "${ARTIFACTS_DIR_URL}" != "null" ]; then
-                # ディレクトリURLからファイルパスを構築
-                ARTIFACT_URL="${ARTIFACTS_DIR_URL}/artifact-${CIRCLE_SHA1:0:7}.zip"
-              else
-                echo "Error: Could not find artifact in response"
-                echo "Response: ${ARTIFACTS_JSON}"
-                exit 1
-              fi
+            # distディレクトリが既に存在する場合は削除
+            if [ -d dist ]; then
+              rm -rf dist
             fi
+            mkdir -p dist
             
-            echo "Downloading artifact from: ${ARTIFACT_URL}"
-            curl -L -o artifact.zip "${ARTIFACT_URL}"
+            # アーティファクトを展開
+            unzip "${ARTIFACT_FILE}" -d dist
             
-            if [ ! -f artifact.zip ] || [ ! -s artifact.zip ]; then
-              echo "Error: Failed to download artifact"
-              exit 1
-            fi
-            
-            unzip artifact.zip -d dist
-            
-            # version.txtも取得
-            VERSION_URL=$(echo "${ARTIFACTS_JSON}" | jq -r '.items[]? | select(.path | test("version\\.txt$")) | .url' | head -1)
-            
-            if [ -z "${VERSION_URL}" ] || [ "${VERSION_URL}" = "null" ]; then
-              # ディレクトリから構築を試みる
-              if [ -n "${ARTIFACTS_DIR_URL}" ]; then
-                VERSION_URL="${ARTIFACTS_DIR_URL}/version.txt"
-              fi
-            fi
-            
-            if [ -n "${VERSION_URL}" ] && [ "${VERSION_URL}" != "null" ]; then
-              curl -L -o version.txt "${VERSION_URL}" || {
-                echo "Warning: Could not download version.txt, using current commit SHA"
-                echo ${CIRCLE_SHA1:0:7} > version.txt
-              }
-            else
-              echo "Warning: Could not find version.txt, using current commit SHA"
+            # version.txtを確認
+            if [ ! -f version.txt ]; then
+              echo "Warning: version.txt not found, using current commit SHA"
               echo ${CIRCLE_SHA1:0:7} > version.txt
             fi
       - run:
@@ -156,12 +110,12 @@ jobs:
       - run:
           name: Update deployment status
           command: |
-            circleci run release update production-deploy --status=SUCCESS
+            circleci run release update production-deploy --status=success
           when: on_success
       - run:
           name: Update deployment status (failure)
           command: |
-            circleci run release update production-deploy --status=FAILURE
+            circleci run release update production-deploy --status=failure
           when: on_fail
 
   type-check:
@@ -295,12 +249,12 @@ jobs:
       - run:
           name: Update deployment status
           command: |
-            circleci run release update production-deploy --status=SUCCESS
+            circleci run release update production-deploy --status=success
           when: on_success
       - run:
           name: Update deployment status (failure)
           command: |
-            circleci run release update production-deploy --status=FAILURE
+            circleci run release update production-deploy --status=failure
           when: on_fail
 
 workflows:
