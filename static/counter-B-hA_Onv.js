@@ -1,0 +1,1 @@
+import{c as r,u as o,j as t}from"./client-Cxlp_JKm.js";r(null);new TextEncoder;function s(){const[e,n]=o(0);return t("div",{children:[t("p",{class:"py-2 text-2xl",children:e}),t("button",{class:"px-4 py-2 bg-orange-400 text-white rounded cursor-pointer",onClick:()=>n(e+1),children:"Increment"})]})}export{s as default};
