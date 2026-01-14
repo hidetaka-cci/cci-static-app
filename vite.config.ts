@@ -5,8 +5,7 @@ import ssg from '@hono/vite-ssg'
 import { defineConfig } from 'vite'
 
 export default defineConfig(({ mode }) => {
-  // @ts-expect-error - process.env is available at build time
-  const isProduction = process.env.NODE_ENV === 'production' || mode === 'production'
+  const isProduction = process.env.NODE_ENV === 'production'
   const base = isProduction ? '/cci-static-app/' : '/'
   
   if (mode === 'client') {
