@@ -15,12 +15,33 @@ jobs:
       - run:
           name: Build
           command: npm run build
+      - run:
+          name: Create versioned artifact
+          command: |
+            VERSION=${CIRCLE_SHA1:0:7}
+            echo "Building version: ${VERSION}"
+            # .nojekyllファイルをdistにコピー（存在する場合）
+            if [ -f .nojekyll ]; then
+              cp .nojekyll dist/
+            fi
+            cd dist
+            zip -r ../artifact-${VERSION}.zip .
+            cd ..
+            echo ${VERSION} > version.txt
       - persist_to_workspace:
           root: .
           paths:
             - dist
+            - artifact-*.zip
+            - version.txt
+      - store_artifacts:
+          path: artifact-*.zip
+          destination: artifacts
+      - store_artifacts:
+          path: version.txt
+          destination: artifacts
 
-  deploy:
+  deploy-production:
     docker:
       - image: cimg/node:20.0
     resource_class: small
@@ -28,6 +49,15 @@ jobs:
       - checkout
       - attach_workspace:
           at: .
+      - run:
+          name: Plan deployment
+          command: |
+            VERSION=$(cat version.txt)
+            circleci run release plan production-deploy \
+              --environment-name=production \
+              --component-name=cci-static-app \
+              --target-version=${VERSION} \
+              --namespace=default
       - run:
           name: Deploy to GitHub Pages
           command: |
@@ -38,10 +68,127 @@ jobs:
             cd /tmp/gh-pages
             rm -rf ./*
             cp -r ~/project/dist/* .
-            cp ~/project/.nojekyll .
+            if [ -f ~/project/.nojekyll ]; then
+              cp ~/project/.nojekyll .
+            fi
             git add -A
-            git commit -m "Deploy from CircleCI [skip ci]" || echo "No changes"
+            git commit -m "Deploy version $(cat ~/project/version.txt) from CircleCI [skip ci]" || echo "No changes"
             git push origin gh-pages
+      - run:
+          name: Update deployment status
+          command: |
+            circleci run release update production-deploy --status=SUCCESS
+          when: on_success
+      - run:
+          name: Update deployment status (failure)
+          command: |
+            circleci run release update production-deploy --status=FAILURE
+          when: on_fail
+
+  promote-to-production:
+    docker:
+      - image: cimg/node:20.0
+    resource_class: small
+    parameters:
+      version:
+        type: string
+        default: ""
+      build_number:
+        type: string
+        default: ""
+    steps:
+      - checkout
+      - run:
+          name: Install jq
+          command: |
+            sudo apt-get update && sudo apt-get install -y jq
+      - run:
+          name: Download artifact from CircleCI
+          command: |
+            VERSION=<< parameters.version >>
+            BUILD_NUM=<< parameters.build_number >>
+            if [ -z "$VERSION" ]; then
+              echo "Version parameter is required"
+              exit 1
+            fi
+            # ビルド番号が指定されていない場合、バージョン（コミットハッシュ）から検索
+            if [ -z "$BUILD_NUM" ]; then
+              echo "Searching for build with version ${VERSION}..."
+              # 最新のパイプラインから該当するコミットハッシュのビルドを検索
+              PIPELINE_NUM=$(curl -s -H "Circle-Token: ${CIRCLE_TOKEN}" \
+                "https://circleci.com/api/v2/project/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/pipeline?branch=main" \
+                | jq -r ".items[] | select(.vcs.revision | startswith(\"${VERSION}\")) | .number" | head -1)
+              if [ -z "$PIPELINE_NUM" ]; then
+                echo "Failed to find pipeline for version ${VERSION}"
+                exit 1
+              fi
+              # パイプラインからbuildジョブを検索
+              WORKFLOW_ID=$(curl -s -H "Circle-Token: ${CIRCLE_TOKEN}" \
+                "https://circleci.com/api/v2/project/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/pipeline/${PIPELINE_NUM}/workflow" \
+                | jq -r '.items[0].id')
+              BUILD_NUM=$(curl -s -H "Circle-Token: ${CIRCLE_TOKEN}" \
+                "https://circleci.com/api/v2/workflow/${WORKFLOW_ID}/job" \
+                | jq -r '.items[] | select(.name == "build") | .job_number' | head -1)
+            fi
+            if [ -z "$BUILD_NUM" ]; then
+              echo "Build number is required"
+              exit 1
+            fi
+            echo "Promoting version: ${VERSION} from build ${BUILD_NUM}"
+            mkdir -p /tmp/artifact
+            # CircleCI APIからアーティファクトをダウンロード
+            ARTIFACT_URL=$(curl -s -H "Circle-Token: ${CIRCLE_TOKEN}" \
+              "https://circleci.com/api/v2/project/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/${BUILD_NUM}/artifacts" \
+              | jq -r '.items[] | select(.path | contains("artifact-")) | .url' | head -1)
+            if [ -z "$ARTIFACT_URL" ]; then
+              echo "Failed to find artifact for version ${VERSION} in build ${BUILD_NUM}"
+              exit 1
+            fi
+            curl -s -H "Circle-Token: ${CIRCLE_TOKEN}" -o /tmp/artifact/artifact-${VERSION}.zip "$ARTIFACT_URL"
+            if [ ! -f /tmp/artifact/artifact-${VERSION}.zip ]; then
+              echo "Failed to download artifact for version ${VERSION}"
+              exit 1
+            fi
+      - run:
+          name: Extract artifact
+          command: |
+            VERSION=<< parameters.version >>
+            cd /tmp/artifact
+            unzip -q artifact-${VERSION}.zip -d dist
+      - run:
+          name: Plan promotion
+          command: |
+            VERSION=<< parameters.version >>
+            circleci run release plan production-promote \
+              --environment-name=production \
+              --component-name=cci-static-app \
+              --target-version=${VERSION} \
+              --namespace=default
+      - run:
+          name: Deploy to GitHub Pages
+          command: |
+            git config --global user.email "circleci-bot@example.com"
+            git config --global user.name "circleci-bot"
+            
+            git clone --depth 1 --branch gh-pages https://${GITHUB_TOKEN}@github.com/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}.git /tmp/gh-pages
+            cd /tmp/gh-pages
+            rm -rf ./*
+            cp -r /tmp/artifact/dist/* .
+            git add -A
+            VERSION=<< parameters.version >>
+            git commit -m "Promote version ${VERSION} to production [skip ci]" || echo "No changes"
+            git push origin gh-pages
+      - run:
+          name: Update promotion status
+          command: |
+            circleci run release update production-promote --status=SUCCESS
+          when: on_success
+      - run:
+          name: Update promotion status (failure)
+          command: |
+            circleci run release update production-promote --status=FAILURE
+          when: on_fail
+
   type-check:
     docker:
       - image: cimg/node:20.0
@@ -61,15 +208,9 @@ workflows:
           filters:
             branches:
               ignore: gh-pages
-  build-and-deploy:
+  build:
     jobs:
       - build:
-          filters:
-            branches:
-              only: main
-      - deploy:
-          requires:
-            - build
           filters:
             branches:
               only: main
