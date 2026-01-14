@@ -68,7 +68,7 @@ npm run dev
 npm run build
 ```
 
-ビルドが完了すると、`static` フォルダ（または `dist` フォルダ）に静的なHTMLファイルが生成されます。
+ビルドが完了すると、`dist` フォルダに静的なHTMLファイルが生成されます。
 
 ### ビルド後のプレビュー
 
@@ -84,7 +84,7 @@ npm run preview
 
 ビルド後、以下のディレクトリにファイルが生成されます：
 
-- `static/` または `dist/`: 静的HTMLファイルとアセット
+- `dist/`: 静的HTMLファイルとアセット
 
 生成されたファイルを確認して、期待通りの出力になっているか確認してください。
 
@@ -92,14 +92,20 @@ npm run preview
 
 ### GitHub Pagesへのデプロイ
 
-このプロジェクトはGitHub Actionsを使用して自動デプロイが設定されています。
+このプロジェクトはCircleCIを使用して自動デプロイが設定されています。
 
-#### 1. GitHubリポジトリの設定
+#### 1. CircleCIの設定
+
+1. CircleCIのダッシュボードでプロジェクトをGitHubリポジトリに接続します
+2. プロジェクト設定で以下の環境変数を設定します：
+   - `GITHUB_TOKEN`: GitHub Personal Access Token（`repo` スコープが必要）
+
+#### 2. GitHubリポジトリの設定
 
 1. GitHubリポジトリの **Settings > Pages** を開きます
-2. **Build and deployment > Source** を **「GitHub Actions」** に変更します
+2. **Build and deployment > Source** を **「Deploy from a branch」** に設定し、**Branch** を `gh-pages` に設定します
 
-#### 2. 自動デプロイ
+#### 3. 自動デプロイ
 
 `main` ブランチにプッシュすると、自動的にビルドとデプロイが実行されます。
 
@@ -107,9 +113,9 @@ npm run preview
 git push origin main
 ```
 
-#### 3. デプロイの確認
+#### 4. デプロイの確認
 
-GitHub Actionsのワークフローが完了すると、以下のURLでサイトにアクセスできます：
+CircleCIのワークフローが完了すると、以下のURLでサイトにアクセスできます：
 
 ```
 https://<ユーザー名>.github.io/cci-static-app/
@@ -117,10 +123,13 @@ https://<ユーザー名>.github.io/cci-static-app/
 
 ### 手動デプロイ
 
-GitHub Actionsを使わずに手動でデプロイする場合：
+CircleCIを使わずに手動でデプロイする場合：
 
 1. ビルドを実行: `npm run build`
-2. 生成された `static` フォルダ（または `dist` フォルダ）の内容をGitHub Pagesの設定に従ってデプロイ
+2. `gh-pages` ブランチにビルド成果物をデプロイ:
+   ```bash
+   npx gh-pages -d dist
+   ```
 
 ## ルーティング
 
@@ -161,7 +170,8 @@ HonoXはIslands Architectureを採用しており、静的サイトでもイン�
 
 - リポジトリ名が `cci-static-app` と一致しているか確認
 - `vite.config.ts` の `base` パスが正しく設定されているか確認
-- GitHub Actionsのワークフローで出力ディレクトリ（`path`）が正しいか確認
+- CircleCIのワークフローでビルド出力ディレクトリ（`dist`）が正しいか確認
+- `gh-pages` ブランチに正しくデプロイされているか確認
 
 ## ライセンス
 
