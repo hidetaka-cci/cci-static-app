@@ -121,7 +121,8 @@ jobs:
             
             git clone --depth 1 --branch gh-pages https://${GITHUB_TOKEN}@github.com/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}.git /tmp/gh-pages
             cd /tmp/gh-pages
-            rm -rf ./*
+            # .git 以外を完全に置き換える（ドットファイルも含めて消す）
+            find . -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
             cp -r ~/project/dist/* .
             if [ -f ~/project/.nojekyll ]; then
               cp ~/project/.nojekyll .
@@ -413,13 +414,15 @@ jobs:
             
             git clone --depth 1 --branch gh-pages https://${GITHUB_TOKEN}@github.com/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}.git /tmp/gh-pages
             cd /tmp/gh-pages
-            rm -rf ./*
+            # promote-production（Artifact Promotion/ロールバック）では、gh-pages の内容をアーティファクトの内容に確実に一致させたい。
+            # `.git` 以外を完全に置き換える（ドットファイルも含めて消す）
+            find . -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
             cp -r ~/project/dist/* .
             if [ -f ~/project/.nojekyll ]; then
               cp ~/project/.nojekyll .
             fi
             git add -A
-            # ロールバック/再デプロイでは差分が無くても「デプロイした」という履歴（push）が必要なため、空コミットを許可する
+            # 差分が無くても push を発生させ、GitHub Pages のデプロイトリガー/整合性を担保する
             git commit --allow-empty -m "Deploy version $(cat ~/project/version.txt) from CircleCI [skip ci]"
             git push origin gh-pages
       - run:
@@ -437,12 +440,13 @@ jobs:
             circleci run release update production-deploy --status=FAILED || true
           when: on_fail
       - run:
-          name: Fail job if download failed
+          name: Assert download succeeded
           command: |
             if [ -f promotion-output/download_exit_code.txt ] && [ "$(cat promotion-output/download_exit_code.txt)" != "0" ]; then
               echo "Failing job due to download failure (rc=$(cat promotion-output/download_exit_code.txt))"
               exit 1
             fi
+            echo "Download OK"
 
 workflows:
   test:
