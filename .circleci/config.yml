@@ -110,12 +110,12 @@ jobs:
       - run:
           name: Update deployment status
           command: |
-            circleci run release update production-deploy --status=success
+            circleci run release update production-deploy --status=SUCCESS
           when: on_success
       - run:
           name: Update deployment status (failure)
           command: |
-            circleci run release update production-deploy --status=failure
+            circleci run release update production-deploy --status=FAILED
           when: on_fail
 
   type-check:
@@ -143,66 +143,145 @@ jobs:
       - run:
           name: Download artifact for target version
           command: |
+            set -euo pipefail
+
+            DEBUG_DIR="promotion-debug"
+            OUT_DIR="promotion-output"
+            mkdir -p "${DEBUG_DIR}" "${OUT_DIR}"
+
+            log() {
+              # shellcheck disable=SC2145
+              echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $@" | tee -a "${DEBUG_DIR}/run.log"
+            }
+
+            # 失敗時にも最低限の情報が artifact に残るようにする（機密は出さない）
+            trap 'rc=$?; echo "exit_code=${rc}" > "'"${DEBUG_DIR}"'/exit.txt"; \
+              { echo "CIRCLE_PIPELINE_ID=${CIRCLE_PIPELINE_ID:-}"; echo "CIRCLE_WORKFLOW_ID=${CIRCLE_WORKFLOW_ID:-}"; echo "CIRCLE_BUILD_NUM=${CIRCLE_BUILD_NUM:-}"; echo "CIRCLE_BRANCH=${CIRCLE_BRANCH:-}"; echo "CIRCLE_SHA1=${CIRCLE_SHA1:-}"; } > "'"${DEBUG_DIR}"'/circle-env.txt"; \
+              printenv | grep "^CIRCLE_" | grep -Ev "TOKEN|PASS|PASSWORD|SECRET|KEY" | sort > "'"${DEBUG_DIR}"'/circle-env-all-sanitized.txt"; \
+              exit ${rc}' EXIT
+
+            # 1) 手動上書き（workflowから渡されたパラメータ）
             TARGET_VERSION="<< parameters.target_version >>"
-            echo "Promoting version: ${TARGET_VERSION}"
-            
+
+            # 2) Artifact Promotion 起点では pipeline.parameters.target_version が空になることがあるため、
+            #    現在のパイプライン情報からコミットSHA/元パイプラインIDを推測して埋める。
+            #    まずは "source_pipeline_id" があればそれを優先する。
+            if [ -z "${TARGET_VERSION}" ]; then
+              if [ -z "${CIRCLE_PIPELINE_ID:-}" ]; then
+                log "Error: CIRCLE_PIPELINE_ID is not set and target_version is empty"
+                exit 1
+              fi
+
+              PIPELINE_SELF_API="https://circleci.com/api/v2/pipeline/${CIRCLE_PIPELINE_ID}"
+              log "Resolving target version from current pipeline: ${PIPELINE_SELF_API}"
+              curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${PIPELINE_SELF_API}" -o "${DEBUG_DIR}/pipeline-self.json"
+              PIPELINE_SELF_JSON="$(cat "${DEBUG_DIR}/pipeline-self.json")"
+
+              SOURCE_PIPELINE_ID=$(echo "${PIPELINE_SELF_JSON}" | jq -r '.trigger_parameters.source_pipeline_id // .trigger_parameters["source_pipeline_id"] // empty')
+              if [ -n "${SOURCE_PIPELINE_ID}" ]; then
+                log "Found source pipeline ID: ${SOURCE_PIPELINE_ID}"
+                PIPELINE_SRC_API="https://circleci.com/api/v2/pipeline/${SOURCE_PIPELINE_ID}"
+                curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${PIPELINE_SRC_API}" -o "${DEBUG_DIR}/pipeline-source.json"
+                PIPELINE_SRC_JSON="$(cat "${DEBUG_DIR}/pipeline-source.json")"
+                SOURCE_REVISION=$(echo "${PIPELINE_SRC_JSON}" | jq -r '.vcs.revision // empty')
+                if [ -n "${SOURCE_REVISION}" ]; then
+                  TARGET_VERSION="${SOURCE_REVISION:0:7}"
+                fi
+              fi
+
+              # source_pipeline_id が取れない/ revision が無い場合は、パイプラインJSON全体からSHA1(40桁)っぽい文字列を拾う
+              if [ -z "${TARGET_VERSION}" ]; then
+                ANY_REVISION=$(echo "${PIPELINE_SELF_JSON}" | jq -r '.. | strings | select(test("^[0-9a-f]{40}$"))' | head -1)
+                if [ -n "${ANY_REVISION}" ]; then
+                  TARGET_VERSION="${ANY_REVISION:0:7}"
+                fi
+              fi
+            fi
+
+            if [ -z "${TARGET_VERSION}" ]; then
+              log "Error: target_version is empty. (Artifact Promotion のメタ情報からも解決できませんでした)"
+              log "Hint: 手動で pipeline parameter target_version（7桁SHA）を渡してください。"
+              exit 1
+            fi
+
+            log "Promoting version: ${TARGET_VERSION}"
+            echo "${TARGET_VERSION}" > "${DEBUG_DIR}/target-version.txt"
+
             # CIRCLE_PROJECT_SLUGを構築（GitHubの場合はgh/org/repo形式）
             CIRCLE_PROJECT_SLUG="gh/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
-            
-            # 指定されたコミットのパイプラインIDを取得
-            PIPELINE_API="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/pipeline?branch=main"
-            echo "Fetching pipelines from: ${PIPELINE_API}"
-            
-            PIPELINE_ID=$(curl -H "Circle-Token: ${CIRCLE_TOKEN}" "${PIPELINE_API}" \
-              | jq -r ".items[] | select(.vcs.revision | startswith(\"${TARGET_VERSION}\")) | .id" | head -1)
-            
+            echo "${CIRCLE_PROJECT_SLUG}" > "${DEBUG_DIR}/project-slug.txt"
+
+            # 指定されたコミットのパイプラインIDを取得（見つからない場合に備えてページネーション対応）
+            PIPELINE_ID=""
+            NEXT_PAGE_TOKEN=""
+            PAGE=0
+            while [ -z "${PIPELINE_ID}" ] && [ "${PAGE}" -lt 25 ]; do
+              if [ -n "${NEXT_PAGE_TOKEN}" ]; then
+                PIPELINE_API="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/pipeline?branch=main&page-token=${NEXT_PAGE_TOKEN}"
+              else
+                PIPELINE_API="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/pipeline?branch=main"
+              fi
+
+              log "Fetching pipelines from: ${PIPELINE_API}"
+              curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${PIPELINE_API}" -o "${DEBUG_DIR}/pipelines-page-${PAGE}.json"
+              PIPELINES_JSON="$(cat "${DEBUG_DIR}/pipelines-page-${PAGE}.json")"
+
+              PIPELINE_ID=$(echo "${PIPELINES_JSON}" | jq -r ".items[]? | select((.vcs.revision // \"\") | startswith(\"${TARGET_VERSION}\")) | .id" | head -1)
+              NEXT_PAGE_TOKEN=$(echo "${PIPELINES_JSON}" | jq -r '.next_page_token // empty')
+
+              if [ -z "${NEXT_PAGE_TOKEN}" ]; then
+                break
+              fi
+              PAGE=$((PAGE + 1))
+            done
+
             if [ -z "${PIPELINE_ID}" ]; then
-              echo "Error: Could not find pipeline for commit ${TARGET_VERSION}"
+              log "Error: Could not find pipeline for commit ${TARGET_VERSION}"
               exit 1
             fi
-            echo "Found pipeline ID: ${PIPELINE_ID}"
-            
-            # ワークフローIDを取得
+            log "Found pipeline ID: ${PIPELINE_ID}"
+            echo "${PIPELINE_ID}" > "${DEBUG_DIR}/pipeline-id.txt"
+
+            # ワークフローIDを取得（build-and-deploy を明示的に選ぶ）
             WORKFLOW_API="https://circleci.com/api/v2/pipeline/${PIPELINE_ID}/workflow"
-            WORKFLOW_ID=$(curl -H "Circle-Token: ${CIRCLE_TOKEN}" "${WORKFLOW_API}" \
-              | jq -r '.items[0].id')
-            
+            curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${WORKFLOW_API}" -o "${DEBUG_DIR}/workflows.json"
+            WORKFLOW_ID=$(cat "${DEBUG_DIR}/workflows.json" \
+              | jq -r '.items[]? | select(.name == "build-and-deploy") | .id' | head -1)
+
             if [ -z "${WORKFLOW_ID}" ]; then
-              echo "Error: Could not find workflow for pipeline ${PIPELINE_ID}"
+              log "Error: Could not find workflow build-and-deploy for pipeline ${PIPELINE_ID}"
               exit 1
             fi
-            echo "Found workflow ID: ${WORKFLOW_ID}"
-            
-            # ビルドジョブの番号を取得
+            log "Found workflow ID: ${WORKFLOW_ID}"
+            echo "${WORKFLOW_ID}" > "${DEBUG_DIR}/workflow-id.txt"
+
+            # ビルドジョブの番号を取得（build を明示的に選ぶ）
             JOB_API="https://circleci.com/api/v2/workflow/${WORKFLOW_ID}/job"
-            BUILD_NUM=$(curl -H "Circle-Token: ${CIRCLE_TOKEN}" "${JOB_API}" \
-              | jq -r '.items[] | select(.name == "build") | .job_number')
-            
+            curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${JOB_API}" -o "${DEBUG_DIR}/jobs.json"
+            BUILD_NUM=$(cat "${DEBUG_DIR}/jobs.json" \
+              | jq -r '.items[]? | select(.name == "build") | .job_number' | head -1)
+
             if [ -z "${BUILD_NUM}" ]; then
-              echo "Error: Could not find build job in workflow ${WORKFLOW_ID}"
+              log "Error: Could not find build job in workflow ${WORKFLOW_ID}"
               exit 1
             fi
-            echo "Found build job number: ${BUILD_NUM}"
-            
+            log "Found build job number: ${BUILD_NUM}"
+            echo "${BUILD_NUM}" > "${DEBUG_DIR}/build-job-number.txt"
+
             # アーティファクトをダウンロード
             ARTIFACTS_URL="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/${BUILD_NUM}/artifacts"
-            echo "Fetching artifacts from: ${ARTIFACTS_URL}"
-            
-            ARTIFACTS_JSON=$(curl -L -H "Circle-Token: ${CIRCLE_TOKEN}" "${ARTIFACTS_URL}")
-            
-            if [ -z "${ARTIFACTS_JSON}" ] || [ "${ARTIFACTS_JSON}" = "null" ]; then
-              echo "Error: Could not fetch artifacts from API"
-              exit 1
-            fi
-            
+            log "Fetching artifacts from: ${ARTIFACTS_URL}"
+
+            curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${ARTIFACTS_URL}" -o "${DEBUG_DIR}/artifacts.json"
+            ARTIFACTS_JSON="$(cat "${DEBUG_DIR}/artifacts.json")"
+
             # アーティファクトファイルを探す（artifact-*.zip）
             ARTIFACT_URL=$(echo "${ARTIFACTS_JSON}" | jq -r '.items[]? | select(.path | test("artifact-.*\\.zip$")) | .url' | head -1)
-            
+
             # 見つからない場合は、artifactsディレクトリから構築
             if [ -z "${ARTIFACT_URL}" ] || [ "${ARTIFACT_URL}" = "null" ]; then
               ARTIFACTS_DIR_URL=$(echo "${ARTIFACTS_JSON}" | jq -r '.items[]? | select(.path == "artifacts") | .url' | head -1)
               if [ -n "${ARTIFACTS_DIR_URL}" ] && [ "${ARTIFACTS_DIR_URL}" != "null" ]; then
-                # ディレクトリURLからファイルパスを構築
                 ARTIFACT_URL="${ARTIFACTS_DIR_URL}/artifact-${TARGET_VERSION}.zip"
               else
                 echo "Error: Could not find artifact in response"
@@ -210,17 +289,23 @@ jobs:
                 exit 1
               fi
             fi
-            
-            echo "Downloading artifact from: ${ARTIFACT_URL}"
-            curl -L -o artifact.zip "${ARTIFACT_URL}"
-            
-            if [ ! -f artifact.zip ] || [ ! -s artifact.zip ]; then
-              echo "Error: Failed to download artifact"
+
+            log "Downloading artifact from: ${ARTIFACT_URL}"
+            echo "${ARTIFACT_URL}" > "${DEBUG_DIR}/artifact-url.txt"
+            curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" -o "${OUT_DIR}/artifact.zip" "${ARTIFACT_URL}"
+
+            if [ ! -f "${OUT_DIR}/artifact.zip" ] || [ ! -s "${OUT_DIR}/artifact.zip" ]; then
+              log "Error: Failed to download artifact"
               exit 1
             fi
-            
-            unzip artifact.zip -d dist
-            echo ${TARGET_VERSION} > version.txt
+
+            mkdir -p dist
+            unzip -o "${OUT_DIR}/artifact.zip" -d dist
+            # 後続step互換のため、ルートにも version.txt を作成する
+            echo "${TARGET_VERSION}" > "${OUT_DIR}/version.txt"
+            cp -f "${OUT_DIR}/version.txt" version.txt
+            cp -f version.txt "${DEBUG_DIR}/version.txt"
+            log "Downloaded and extracted artifact OK"
       - run:
           name: Plan deployment
           command: |
@@ -249,13 +334,17 @@ jobs:
       - run:
           name: Update deployment status
           command: |
-            circleci run release update production-deploy --status=success
+            circleci run release update production-deploy --status=SUCCESS
           when: on_success
       - run:
           name: Update deployment status (failure)
           command: |
-            circleci run release update production-deploy --status=failure
+            circleci run release update production-deploy --status=FAILED
           when: on_fail
+      - store_artifacts:
+          path: promotion-debug
+      - store_artifacts:
+          path: promotion-output
 
 workflows:
   test:
