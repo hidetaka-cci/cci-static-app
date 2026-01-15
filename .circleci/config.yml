@@ -419,7 +419,8 @@ jobs:
               cp ~/project/.nojekyll .
             fi
             git add -A
-            git commit -m "Deploy version $(cat ~/project/version.txt) from CircleCI [skip ci]" || echo "No changes"
+            # ロールバック/再デプロイでは差分が無くても「デプロイした」という履歴（push）が必要なため、空コミットを許可する
+            git commit --allow-empty -m "Deploy version $(cat ~/project/version.txt) from CircleCI [skip ci]"
             git push origin gh-pages
       - run:
           name: Update deployment status
