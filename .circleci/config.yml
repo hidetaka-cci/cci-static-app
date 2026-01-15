@@ -240,7 +240,25 @@ jobs:
                 curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${PIPELINE_API}" -o "${DEBUG_DIR}/pipelines-page-${PAGE}.json"
                 PIPELINES_JSON="$(cat "${DEBUG_DIR}/pipelines-page-${PAGE}.json")"
 
-                PIPELINE_ID=$(echo "${PIPELINES_JSON}" | jq -r ".items[]? | select(((.vcs.revision // .trigger_parameters.github_app.commit_sha // .trigger_parameters.git.checkout_sha // \"\")) | startswith(\"${TARGET_VERSION}\")) | .id" | head -1)
+                # 同一commitに対して「promotion(api trigger)のpipeline」と「通常(webhook)のpipeline」が共存しうる。
+                # promotion pipeline 自身（= CIRCLE_PIPELINE_ID）を掴むと build-and-deploy が無くて失敗するため、
+                # まずは「自分自身を除外 + api trigger を除外」して通常pipelineを優先する。
+                PIPELINE_ID=$(echo "${PIPELINES_JSON}" | jq -r --arg tv "${TARGET_VERSION}" --arg cur "${CIRCLE_PIPELINE_ID:-}" '
+                  def sha: (.vcs.revision // .trigger_parameters.github_app.commit_sha // .trigger_parameters.git.checkout_sha // "");
+                  .items[]?
+                  | select((sha | startswith($tv)) and (.id != $cur) and ((.trigger.type // "") != "api"))
+                  | .id
+                ' | head -1)
+
+                # それでも見つからない場合は「自分自身だけ除外」してfallback（古いデータ/フィールド差分対策）
+                if [ -z "${PIPELINE_ID}" ]; then
+                  PIPELINE_ID=$(echo "${PIPELINES_JSON}" | jq -r --arg tv "${TARGET_VERSION}" --arg cur "${CIRCLE_PIPELINE_ID:-}" '
+                    def sha: (.vcs.revision // .trigger_parameters.github_app.commit_sha // .trigger_parameters.git.checkout_sha // "");
+                    .items[]?
+                    | select((sha | startswith($tv)) and (.id != $cur))
+                    | .id
+                  ' | head -1)
+                fi
                 NEXT_PAGE_TOKEN=$(echo "${PIPELINES_JSON}" | jq -r '.next_page_token // empty')
 
                 if [ -z "${NEXT_PAGE_TOKEN}" ]; then
@@ -252,7 +270,14 @@ jobs:
               if [ -z "${PIPELINE_ID}" ]; then
                 log "Error: Could not find pipeline for commit ${TARGET_VERSION}"
                 # デバッグ用: 先頭数件の候補SHAを出す（機密なし）
-                CANDIDATES=$(echo "${PIPELINES_JSON}" | jq -r '[.items[]? | {id, sha:(.vcs.revision // .trigger_parameters.github_app.commit_sha // .trigger_parameters.git.checkout_sha // "")} | select(.sha != "") | "\(.id) \(.sha[0:7])"] | .[0:5] | join(", ")')
+                  CANDIDATES=$(echo "${PIPELINES_JSON}" | jq -r '
+                    def sha: (.vcs.revision // .trigger_parameters.github_app.commit_sha // .trigger_parameters.git.checkout_sha // "");
+                    [.items[]?
+                      | {id, trig:(.trigger.type // ""), num:(.number // ""), sha:(sha)}
+                      | select(.sha != "")
+                      | "\(.id) num=\(.num) trig=\(.trig) sha7=\(.sha[0:7])"
+                    ] | .[0:5] | join(", ")
+                  ')
                 if [ -n "${CANDIDATES}" ] && [ "${CANDIDATES}" != "null" ]; then
                   log "Candidate pipelines (id sha7): ${CANDIDATES}"
                 fi
