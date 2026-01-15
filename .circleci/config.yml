@@ -240,7 +240,7 @@ jobs:
                 curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${PIPELINE_API}" -o "${DEBUG_DIR}/pipelines-page-${PAGE}.json"
                 PIPELINES_JSON="$(cat "${DEBUG_DIR}/pipelines-page-${PAGE}.json")"
 
-                PIPELINE_ID=$(echo "${PIPELINES_JSON}" | jq -r ".items[]? | select((.vcs.revision // \"\") | startswith(\"${TARGET_VERSION}\")) | .id" | head -1)
+                PIPELINE_ID=$(echo "${PIPELINES_JSON}" | jq -r ".items[]? | select(((.vcs.revision // .trigger_parameters.github_app.commit_sha // .trigger_parameters.git.checkout_sha // \"\")) | startswith(\"${TARGET_VERSION}\")) | .id" | head -1)
                 NEXT_PAGE_TOKEN=$(echo "${PIPELINES_JSON}" | jq -r '.next_page_token // empty')
 
                 if [ -z "${NEXT_PAGE_TOKEN}" ]; then
@@ -251,6 +251,11 @@ jobs:
 
               if [ -z "${PIPELINE_ID}" ]; then
                 log "Error: Could not find pipeline for commit ${TARGET_VERSION}"
+                # デバッグ用: 先頭数件の候補SHAを出す（機密なし）
+                CANDIDATES=$(echo "${PIPELINES_JSON}" | jq -r '[.items[]? | {id, sha:(.vcs.revision // .trigger_parameters.github_app.commit_sha // .trigger_parameters.git.checkout_sha // "")} | select(.sha != "") | "\(.id) \(.sha[0:7])"] | .[0:5] | join(", ")')
+                if [ -n "${CANDIDATES}" ] && [ "${CANDIDATES}" != "null" ]; then
+                  log "Candidate pipelines (id sha7): ${CANDIDATES}"
+                fi
                 exit 1
               fi
               log "Found pipeline ID: ${PIPELINE_ID}"
