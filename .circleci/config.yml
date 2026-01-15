@@ -36,14 +36,30 @@ jobs:
             zip -r ../artifact-${VERSION}.zip .
             cd ..
             echo ${VERSION} > version.txt
+            # store_artifacts は glob をサポートしないため、アップロード対象をディレクトリに集約する
+            # 参照: https://discuss.circleci.com/t/does-store-artifacts-support-glob/44304
+            mkdir -p artifacts
+            cp "artifact-${VERSION}.zip" "artifacts/artifact-${VERSION}.zip"
+            cp "artifact-${VERSION}.zip" "artifacts/artifact.zip"
+            cp "version.txt" "artifacts/version.txt"
+      - run:
+          name: Verify artifacts exist
+          command: |
+            set -euo pipefail
+            echo "Artifacts directory contents:"
+            ls -al artifacts
+            test -s artifacts/artifact.zip
+            test -s artifacts/version.txt
       - persist_to_workspace:
           root: .
           paths:
             - dist
             - artifact-*.zip
             - version.txt
+            - artifacts
       - store_artifacts:
-          path: artifact-*.zip
+          path: artifacts
+          destination: artifacts
       - store_artifacts:
           path: version.txt
 
@@ -59,7 +75,13 @@ jobs:
           name: Extract artifact from workspace
           command: |
             # workspaceからアーティファクトファイルを探す
-            ARTIFACT_FILE=$(ls artifact-*.zip 2>/dev/null | head -1)
+            ARTIFACT_FILE=$(ls artifacts/artifact.zip 2>/dev/null | head -1)
+            if [ -z "${ARTIFACT_FILE}" ]; then
+              ARTIFACT_FILE=$(ls artifact.zip 2>/dev/null | head -1)
+            fi
+            if [ -z "${ARTIFACT_FILE}" ]; then
+              ARTIFACT_FILE=$(ls artifact-*.zip 2>/dev/null | head -1)
+            fi
             
             if [ -z "${ARTIFACT_FILE}" ]; then
               echo "Error: Could not find artifact file in workspace"
@@ -319,14 +341,18 @@ jobs:
               curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${ARTIFACTS_URL}" -o "${DEBUG_DIR}/artifacts.json"
               ARTIFACTS_JSON="$(cat "${DEBUG_DIR}/artifacts.json")"
 
-              # アーティファクトファイルを探す（artifact-*.zip）
-              ARTIFACT_URL=$(echo "${ARTIFACTS_JSON}" | jq -r '.items[]? | select(.path | test("artifact-.*\\.zip$")) | .url' | head -1)
+              # アーティファクトファイルを探す（固定名 artifact.zip を優先）
+              ARTIFACT_URL=$(echo "${ARTIFACTS_JSON}" | jq -r '
+                ( .items[]? | select(.path | test("artifact\\.zip$")) | .url ),
+                ( .items[]? | select(.path | test("artifact-.*\\.zip$")) | .url )
+              ' | head -1)
 
             # 見つからない場合は、artifactsディレクトリから構築
             if [ -z "${ARTIFACT_URL}" ] || [ "${ARTIFACT_URL}" = "null" ]; then
               ARTIFACTS_DIR_URL=$(echo "${ARTIFACTS_JSON}" | jq -r '.items[]? | select(.path == "artifacts") | .url' | head -1)
               if [ -n "${ARTIFACTS_DIR_URL}" ] && [ "${ARTIFACTS_DIR_URL}" != "null" ]; then
-                ARTIFACT_URL="${ARTIFACTS_DIR_URL}/artifact-${TARGET_VERSION}.zip"
+                # build側で artifacts/artifact.zip を常に作るので、まずは固定名を優先する
+                ARTIFACT_URL="${ARTIFACTS_DIR_URL}/artifact.zip"
               else
                 echo "Error: Could not find artifact in response"
                 echo "Response: ${ARTIFACTS_JSON}"
