@@ -329,6 +329,5 @@ workflows:
     when:
       equal: [ promote, << pipeline.parameters.deploy_type >> ]
     jobs:
-      - promote-production:
-          # Promotion (Deploys) から渡される pipeline.deploy.target_version を利用する
+      - promote-production
 
