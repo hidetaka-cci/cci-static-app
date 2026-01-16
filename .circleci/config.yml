@@ -7,6 +7,9 @@ parameters:
   target_version:
     type: string
     default: ""
+  target_pipeline_number:
+    type: integer
+    default: 0
 
 orbs:
   node: circleci/node@7.0.0
@@ -161,6 +164,11 @@ jobs:
       target_version:
         type: string
         description: "Target commit SHA (short, 7 chars)"
+        default: ""
+      target_pipeline_number:
+        type: integer
+        description: "Target pipeline number to promote from (0 means auto-detect)"
+        default: 0
     steps:
       - checkout
       - run:
@@ -183,20 +191,77 @@ jobs:
             trap 'rc=$?; echo "exit_code=${rc}" > "'"${DEBUG_DIR}"'/exit.txt"; \
               { echo "CIRCLE_PIPELINE_ID=${CIRCLE_PIPELINE_ID:-}"; echo "CIRCLE_WORKFLOW_ID=${CIRCLE_WORKFLOW_ID:-}"; echo "CIRCLE_BUILD_NUM=${CIRCLE_BUILD_NUM:-}"; echo "CIRCLE_BRANCH=${CIRCLE_BRANCH:-}"; echo "CIRCLE_SHA1=${CIRCLE_SHA1:-}"; } > "'"${DEBUG_DIR}"'/circle-env.txt"; \
               printenv | grep "^CIRCLE_" | grep -Ev "TOKEN|PASS|PASSWORD|SECRET|KEY" | sort > "'"${DEBUG_DIR}"'/circle-env-all-sanitized.txt"; \
+              # Artifact Promotion の参照情報が CIRCLE_ 以外で注入される可能性があるため、全環境変数もサニタイズして保存する
+              # NOTE: 値を含むため、除外条件は強めにする
+              printenv \
+                | grep -Ev "(^|_)(TOKEN|PASS|PASSWORD|SECRET|KEY|COOKIE|AUTH|BEARER)(=|$)" \
+                | grep -Ev "GITHUB_TOKEN|CIRCLE_TOKEN" \
+                | sort > "'"${DEBUG_DIR}"'/env-all-sanitized.txt"; \
+              # Promotion/Artifact/Deploy 関連っぽいキーだけ抜粋（値付き・サニタイズ済み）
+              printenv \
+                | grep -Ei "(PROMOT|PROMOTE|ARTIFACT|DEPLOY|RELEASE|MARKER|VERSION|PIPELINE)" \
+                | grep -Ev "(^|_)(TOKEN|PASS|PASSWORD|SECRET|KEY|COOKIE|AUTH|BEARER)(=|$)" \
+                | grep -Ev "GITHUB_TOKEN|CIRCLE_TOKEN" \
+                | sort > "'"${DEBUG_DIR}"'/env-promotion-hints.txt"; \
               exit ${rc}' EXIT
 
             rc=0
             (
               set -euo pipefail
 
+              # 0) 明示的に元pipeline番号が指定されている場合は、それを最優先する
+              TARGET_PIPELINE_NUMBER="<< parameters.target_pipeline_number >>"
+
               # 1) 手動上書き（workflowから渡されたパラメータ）
               TARGET_VERSION="<< parameters.target_version >>"
               SOURCE_PIPELINE_ID=""
+              SOURCE_PIPELINE_ID_CANDIDATES=""
+
+              # 指定の pipeline number から pipeline id / commit を確定
+              if [ "${TARGET_PIPELINE_NUMBER}" -gt 0 ]; then
+                log "Target pipeline number specified: ${TARGET_PIPELINE_NUMBER}"
+                BEST_ID=""
+                NEXT_PAGE_TOKEN=""
+                PAGE=0
+                while [ -z "${BEST_ID}" ] && [ "${PAGE}" -lt 25 ]; do
+                  if [ -n "${NEXT_PAGE_TOKEN}" ]; then
+                    PIPELINE_API="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/pipeline?page-token=${NEXT_PAGE_TOKEN}"
+                  else
+                    PIPELINE_API="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/pipeline"
+                  fi
+                  log "Fetching pipelines from: ${PIPELINE_API}"
+                  curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${PIPELINE_API}" -o "${DEBUG_DIR}/pipelines-by-number-${PAGE}.json"
+                  PIPELINES_JSON="$(cat "${DEBUG_DIR}/pipelines-by-number-${PAGE}.json")"
+                  BEST_ID=$(echo "${PIPELINES_JSON}" | jq -r --argjson n "${TARGET_PIPELINE_NUMBER}" '.items[]? | select((.number // -1) == $n) | .id' | head -1)
+                  if [ -n "${BEST_ID}" ]; then
+                    # commit_sha を拾えるなら target_version も揃える
+                    if [ -z "${TARGET_VERSION}" ]; then
+                      BEST_SHA=$(echo "${PIPELINES_JSON}" | jq -r --argjson n "${TARGET_PIPELINE_NUMBER}" '.items[]? | select((.number // -1) == $n) | (.vcs.revision // .trigger_parameters.github_app.commit_sha // .trigger_parameters.git.checkout_sha // empty)' | head -1)
+                      if [ -n "${BEST_SHA}" ]; then
+                        TARGET_VERSION="${BEST_SHA:0:7}"
+                      fi
+                    fi
+                    PIPELINE_ID="${BEST_ID}"
+                    log "Using pipeline ID from specified number: ${PIPELINE_ID}"
+                    break
+                  fi
+                  NEXT_PAGE_TOKEN=$(echo "${PIPELINES_JSON}" | jq -r '.next_page_token // empty')
+                  if [ -z "${NEXT_PAGE_TOKEN}" ]; then
+                    break
+                  fi
+                  PAGE=$((PAGE + 1))
+                done
+
+                if [ -z "${PIPELINE_ID:-}" ]; then
+                  log "Error: Could not find pipeline with number ${TARGET_PIPELINE_NUMBER}"
+                  exit 1
+                fi
+              fi
 
               # 2) Artifact Promotion 起点では pipeline.parameters.target_version が空になることがあるため、
               #    現在のパイプライン情報からコミットSHA/元パイプラインIDを推測して埋める。
               #    まずは "source_pipeline_id" があればそれを優先する。
-              if [ -z "${TARGET_VERSION}" ]; then
+              if [ -z "${TARGET_VERSION}" ] && [ -z "${PIPELINE_ID:-}" ]; then
                 if [ -z "${CIRCLE_PIPELINE_ID:-}" ]; then
                   log "Error: CIRCLE_PIPELINE_ID is not set and target_version is empty"
                   exit 1
@@ -208,6 +273,18 @@ jobs:
                 PIPELINE_SELF_JSON="$(cat "${DEBUG_DIR}/pipeline-self.json")"
 
                 SOURCE_PIPELINE_ID=$(echo "${PIPELINE_SELF_JSON}" | jq -r '.trigger_parameters.source_pipeline_id // .trigger_parameters["source_pipeline_id"] // empty')
+                # source_pipeline_id が無い場合でも、trigger_parameters/webhook.body に元pipeline UUID 等が含まれる可能性があるので抽出しておく
+                # 例: UUIDっぽい文字列を全探索（複数ある場合は fail してユーザーに共有させる）
+                SOURCE_PIPELINE_ID_CANDIDATES=$(echo "${PIPELINE_SELF_JSON}" | jq -r --arg cur "${CIRCLE_PIPELINE_ID}" '
+                  [ .. | strings
+                    | select(test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+                    | select(. != $cur)
+                  ] | unique | .[]
+                ' || true)
+                if [ -n "${SOURCE_PIPELINE_ID_CANDIDATES}" ]; then
+                  printf "%s\n" "${SOURCE_PIPELINE_ID_CANDIDATES}" > "${DEBUG_DIR}/source-pipeline-id-candidates.txt"
+                fi
+
                 if [ -n "${SOURCE_PIPELINE_ID}" ]; then
                   log "Found source pipeline ID: ${SOURCE_PIPELINE_ID}"
                   echo "${SOURCE_PIPELINE_ID}" > "${DEBUG_DIR}/source-pipeline-id.txt"
@@ -220,12 +297,17 @@ jobs:
                   fi
                 fi
 
-                # source_pipeline_id が取れない/ revision が無い場合は、パイプラインJSON全体からSHA1(40桁)っぽい文字列を拾う
-                if [ -z "${TARGET_VERSION}" ]; then
-                  ANY_REVISION=$(echo "${PIPELINE_SELF_JSON}" | jq -r '.. | strings | select(test("^[0-9a-f]{40}$"))' | head -1)
-                  if [ -n "${ANY_REVISION}" ]; then
-                    TARGET_VERSION="${ANY_REVISION:0:7}"
+                # セーフティ: source_pipeline_id が無い Artifact Promotion は「どの元pipelineを昇格するか」が特定できないため危険。
+                # commit からの自動探索は誤デプロイに繋がりうるので、ここでは問答無用で fail させる。
+                if [ -z "${SOURCE_PIPELINE_ID}" ] && [ "${TARGET_PIPELINE_NUMBER}" -le 0 ]; then
+                  if [ -n "${SOURCE_PIPELINE_ID_CANDIDATES}" ]; then
+                    log "Error: source_pipeline_id is missing, but UUID candidates exist in trigger payload."
+                    log "Candidates are saved to promotion-debug/source-pipeline-id-candidates.txt"
                   fi
+                  log "Error: Missing source pipeline reference in Artifact Promotion trigger parameters."
+                  log "This is treated as invalid/unsafe promotion request."
+                  log "Fix: set pipeline parameter target_pipeline_number explicitly (e.g. 51)."
+                  exit 1
                 fi
               fi
 
@@ -243,52 +325,33 @@ jobs:
               echo "${CIRCLE_PROJECT_SLUG}" > "${DEBUG_DIR}/project-slug.txt"
 
               # 指定されたコミットのパイプラインIDを取得（可能なら source_pipeline_id を直利用）
-              PIPELINE_ID=""
+              # セーフティ: commit 探索による自動決定は誤デプロイにつながりうるため、ここでは行わない。
+              PIPELINE_ID="${PIPELINE_ID:-}"
               if [ -n "${SOURCE_PIPELINE_ID}" ]; then
                 PIPELINE_ID="${SOURCE_PIPELINE_ID}"
                 log "Using source pipeline ID directly as pipeline ID: ${PIPELINE_ID}"
               fi
 
-              # source_pipeline_id が取れない場合のフォールバック: commit prefix から検索（branch固定しない）
-              NEXT_PAGE_TOKEN=""
-              PAGE=0
-              while [ -z "${PIPELINE_ID}" ] && [ "${PAGE}" -lt 25 ]; do
-                if [ -n "${NEXT_PAGE_TOKEN}" ]; then
-                  PIPELINE_API="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/pipeline?page-token=${NEXT_PAGE_TOKEN}"
-                else
-                  PIPELINE_API="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/pipeline"
+              if [ -z "${PIPELINE_ID}" ]; then
+                # trigger payload 内に候補が 1つだけある場合は、それを source pipeline として採用する（CircleCIが暗黙に渡しているケース対応）
+                if [ -n "${SOURCE_PIPELINE_ID_CANDIDATES}" ]; then
+                  CAND_COUNT=$(printf "%s\n" "${SOURCE_PIPELINE_ID_CANDIDATES}" | wc -l | tr -d " ")
+                  if [ "${CAND_COUNT}" -eq 1 ]; then
+                    PIPELINE_ID=$(printf "%s\n" "${SOURCE_PIPELINE_ID_CANDIDATES}" | head -1)
+                    log "Using unique UUID candidate as source pipeline ID: ${PIPELINE_ID}"
+                  else
+                    log "Error: Multiple UUID candidates found in trigger payload; cannot determine source pipeline safely."
+                    log "Candidates are saved to promotion-debug/source-pipeline-id-candidates.txt"
+                    exit 1
+                  fi
                 fi
+              fi
 
-                log "Fetching pipelines from: ${PIPELINE_API}"
-                curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${PIPELINE_API}" -o "${DEBUG_DIR}/pipelines-page-${PAGE}.json"
-                PIPELINES_JSON="$(cat "${DEBUG_DIR}/pipelines-page-${PAGE}.json")"
-
-                # 同一commitに対して「promotion(api trigger)のpipeline」と「通常(webhook)のpipeline」が共存しうる。
-                # promotion pipeline 自身（= CIRCLE_PIPELINE_ID）を掴むと build-and-deploy が無くて失敗するため、
-                # まずは「自分自身を除外 + api trigger を除外」して通常pipelineを優先する。
-                PIPELINE_ID=$(echo "${PIPELINES_JSON}" | jq -r --arg tv "${TARGET_VERSION}" --arg cur "${CIRCLE_PIPELINE_ID:-}" '
-                  def sha: (.vcs.revision // .trigger_parameters.github_app.commit_sha // .trigger_parameters.git.checkout_sha // "");
-                  .items[]?
-                  | select((sha | startswith($tv)) and (.id != $cur) and ((.trigger.type // "") != "api"))
-                  | .id
-                ' | head -1)
-
-                # それでも見つからない場合は「自分自身だけ除外」してfallback（古いデータ/フィールド差分対策）
-                if [ -z "${PIPELINE_ID}" ]; then
-                  PIPELINE_ID=$(echo "${PIPELINES_JSON}" | jq -r --arg tv "${TARGET_VERSION}" --arg cur "${CIRCLE_PIPELINE_ID:-}" '
-                    def sha: (.vcs.revision // .trigger_parameters.github_app.commit_sha // .trigger_parameters.git.checkout_sha // "");
-                    .items[]?
-                    | select((sha | startswith($tv)) and (.id != $cur))
-                    | .id
-                  ' | head -1)
-                fi
-                NEXT_PAGE_TOKEN=$(echo "${PIPELINES_JSON}" | jq -r '.next_page_token // empty')
-
-                if [ -z "${NEXT_PAGE_TOKEN}" ]; then
-                  break
-                fi
-                PAGE=$((PAGE + 1))
-              done
+              if [ -z "${PIPELINE_ID}" ]; then
+                log "Error: Source pipeline is not specified."
+                log "Fix: set pipeline parameter target_pipeline_number explicitly."
+                exit 1
+              fi
 
               if [ -z "${PIPELINE_ID}" ]; then
                 log "Error: Could not find pipeline for commit ${TARGET_VERSION}"
@@ -476,4 +539,5 @@ workflows:
     jobs:
       - promote-production:
           target_version: << pipeline.parameters.target_version >>
+          target_pipeline_number: << pipeline.parameters.target_pipeline_number >>
 
