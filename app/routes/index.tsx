@@ -6,7 +6,7 @@ export default createRoute((c) => {
   return c.render(
     <div class="py-8 text-center">
       <title>{name}</title>
-      <h1 class="text-3xl font-bold">Hello, {name}.1</h1>
+      <h1 class="text-3xl font-bold">Hello, {name}.12</h1>
       <Counter />
     </div>
   )
