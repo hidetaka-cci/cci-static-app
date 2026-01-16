@@ -101,12 +101,6 @@ jobs:
             
             # アーティファクトを展開
             unzip "${ARTIFACT_FILE}" -d dist
-            
-            # version.txtを確認
-            if [ ! -f version.txt ]; then
-              echo "Warning: version.txt not found, using current commit SHA"
-              echo ${CIRCLE_SHA1:0:7} > version.txt
-            fi
       - run:
           name: Plan deployment
           command: |
@@ -162,23 +156,6 @@ jobs:
     resource_class: small
     steps:
       - checkout
-      - run:
-          name: Resolve promoted version (pipeline.deploy.target_version)
-          command: |
-            echo "pipeline.id=<< pipeline.id >>"
-            echo "pipeline.number=<< pipeline.number >>"
-            echo "pipeline.trigger_source=<< pipeline.trigger_source >>"
-            echo "pipeline.deploy.environment_name=<< pipeline.deploy.environment_name >>"
-            echo "pipeline.deploy.component_name=<< pipeline.deploy.component_name >>"
-            echo "pipeline.deploy.namespace=<< pipeline.deploy.namespace >>"
-            echo "pipeline.deploy.target_version=<< pipeline.deploy.target_version >>"
-            echo "pipeline.deploy.current_version=<< pipeline.deploy.current_version >>"
-            echo "pipeline.deploy.reason=<< pipeline.deploy.reason >>"
-
-            if [ -z "<< pipeline.deploy.target_version >>" ]; then
-              echo "Error: pipeline.deploy.target_version is empty. Artifact Promotion UI selection is not available to this job."
-              exit 1
-            fi
       - run:
           name: Download artifact for promoted version
           command: |
