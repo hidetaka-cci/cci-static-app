@@ -225,11 +225,15 @@ jobs:
             (
               set -euo pipefail
 
-              # 0) 明示的に元pipeline番号が指定されている場合は、それを最優先する
-              TARGET_PIPELINE_NUMBER="<< parameters.target_pipeline_number >>"
+              # 0) Artifact Promotion (Deploys) が渡す pipeline values を最優先する
+              # UIで選択された「promote対象 version」をそのまま使うのが本来の仕様。
+              TARGET_VERSION="<< pipeline.deploy.target_version >>"
 
-              # 1) 手動上書き（workflowから渡されたパラメータ）
-              TARGET_VERSION="<< parameters.target_version >>"
+              # 1) 明示指定（互換用。基本は不要）
+              TARGET_PIPELINE_NUMBER="<< parameters.target_pipeline_number >>"
+              if [ -z "${TARGET_VERSION}" ]; then
+                TARGET_VERSION="<< parameters.target_version >>"
+              fi
               SOURCE_PIPELINE_ID=""
               SOURCE_PIPELINE_ID_CANDIDATES=""
 
@@ -274,9 +278,7 @@ jobs:
                 fi
               fi
 
-              # 2) Artifact Promotion 起点では pipeline.parameters.target_version が空になることがあるため、
-              #    現在のパイプライン情報からコミットSHA/元パイプラインIDを推測して埋める。
-              #    まずは "source_pipeline_id" があればそれを優先する。
+              # 2) target_version が取れない場合のみ、pipeline self を参照してヒントを集める（デバッグ用）
               if [ -z "${TARGET_VERSION}" ] && [ -z "${PIPELINE_ID:-}" ]; then
                 if [ -z "${CIRCLE_PIPELINE_ID:-}" ]; then
                   log "Error: CIRCLE_PIPELINE_ID is not set and target_version is empty"
@@ -313,23 +315,13 @@ jobs:
                   fi
                 fi
 
-                # セーフティ: source_pipeline_id が無い Artifact Promotion は「どの元pipelineを昇格するか」が特定できないため危険。
-                # commit からの自動探索は誤デプロイに繋がりうるので、ここでは問答無用で fail させる。
-                if [ -z "${SOURCE_PIPELINE_ID}" ] && [ "${TARGET_PIPELINE_NUMBER}" -le 0 ]; then
-                  if [ -n "${SOURCE_PIPELINE_ID_CANDIDATES}" ]; then
-                    log "Error: source_pipeline_id is missing, but UUID candidates exist in trigger payload."
-                    log "Candidates are saved to promotion-debug/source-pipeline-id-candidates.txt"
-                  fi
-                  log "Error: Missing source pipeline reference in Artifact Promotion trigger parameters."
-                  log "This is treated as invalid/unsafe promotion request."
-                  log "Fix: set pipeline parameter target_pipeline_number explicitly (e.g. 51)."
-                  exit 1
-                fi
+                # NOTE: Artifact Promotion の本命は pipeline.deploy.target_version なので、
+                # source_pipeline_id が無くても target_version が取れるなら問題ない。
               fi
 
               if [ -z "${TARGET_VERSION}" ]; then
                 log "Error: target_version is empty. (Artifact Promotion のメタ情報からも解決できませんでした)"
-                log "Hint: 手動で pipeline parameter target_version（7桁SHA）を渡してください。"
+                log "Hint: pipeline.deploy.target_version が渡っていない可能性があります。"
                 exit 1
               fi
 
@@ -340,34 +332,59 @@ jobs:
               CIRCLE_PROJECT_SLUG="gh/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
               echo "${CIRCLE_PROJECT_SLUG}" > "${DEBUG_DIR}/project-slug.txt"
 
-              # 指定されたコミットのパイプラインIDを取得（可能なら source_pipeline_id を直利用）
-              # セーフティ: commit 探索による自動決定は誤デプロイにつながりうるため、ここでは行わない。
-              PIPELINE_ID="${PIPELINE_ID:-}"
-              if [ -n "${SOURCE_PIPELINE_ID}" ]; then
-                PIPELINE_ID="${SOURCE_PIPELINE_ID}"
-                log "Using source pipeline ID directly as pipeline ID: ${PIPELINE_ID}"
-              fi
-
-              if [ -z "${PIPELINE_ID}" ]; then
-                # trigger payload 内に候補が 1つだけある場合は、それを source pipeline として採用する（CircleCIが暗黙に渡しているケース対応）
-                if [ -n "${SOURCE_PIPELINE_ID_CANDIDATES}" ]; then
-                  CAND_COUNT=$(printf "%s\n" "${SOURCE_PIPELINE_ID_CANDIDATES}" | wc -l | tr -d " ")
-                  if [ "${CAND_COUNT}" -eq 1 ]; then
-                    PIPELINE_ID=$(printf "%s\n" "${SOURCE_PIPELINE_ID_CANDIDATES}" | head -1)
-                    log "Using unique UUID candidate as source pipeline ID: ${PIPELINE_ID}"
-                  else
-                    log "Error: Multiple UUID candidates found in trigger payload; cannot determine source pipeline safely."
-                    log "Candidates are saved to promotion-debug/source-pipeline-id-candidates.txt"
-                    exit 1
-                  fi
+              # 3) promote 対象 version から「その成果物を作った build pipeline」を探す
+              # ここでは “同じversionのpipeline” を探し、promotion pipeline自身(api)を除外して webhook 優先で選ぶ
+              PIPELINE_ID=""
+              NEXT_PAGE_TOKEN=""
+              PAGE=0
+              BEST_PIPELINE_ID=""
+              BEST_PIPELINE_NUMBER=-1
+              while [ -z "${BEST_PIPELINE_ID}" ] && [ "${PAGE}" -lt 25 ]; do
+                if [ -n "${NEXT_PAGE_TOKEN}" ]; then
+                  PIPELINE_API="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/pipeline?page-token=${NEXT_PAGE_TOKEN}"
+                else
+                  PIPELINE_API="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/pipeline"
                 fi
-              fi
+                log "Fetching pipelines from: ${PIPELINE_API}"
+                curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${PIPELINE_API}" -o "${DEBUG_DIR}/pipelines-page-${PAGE}.json"
+                PIPELINES_JSON="$(cat "${DEBUG_DIR}/pipelines-page-${PAGE}.json")"
 
-              if [ -z "${PIPELINE_ID}" ]; then
-                log "Error: Source pipeline is not specified."
-                log "Fix: set pipeline parameter target_pipeline_number explicitly."
+                # 候補: sha一致（vcs.revision or trigger_parameters.*）かつ promotion pipeline自身を除外
+                CAND_LINE=$(echo "${PIPELINES_JSON}" | jq -r --arg tv "${TARGET_VERSION}" --arg cur "${CIRCLE_PIPELINE_ID:-}" '
+                  def sha: (.vcs.revision // .trigger_parameters.github_app.commit_sha // .trigger_parameters.git.checkout_sha // "");
+                  [ .items[]?
+                    | select((sha | startswith($tv)) and (.id != $cur))
+                    | {id: .id, num: (.number // -1), trig:(.trigger.type // "")}
+                    # webhook を優先しつつ、同条件なら number が大きい（最新）ものを優先
+                  ]
+                  | sort_by(.num)
+                  | reverse
+                  | map(select(.trig != "api")) + map(select(.trig == "api"))
+                  | if length > 0 then "\(. [0].id) \(. [0].num) \(. [0].trig)" else "" end
+                ')
+                if [ -n "${CAND_LINE}" ]; then
+                  BEST_PIPELINE_ID=$(echo "${CAND_LINE}" | awk '{print $1}')
+                  BEST_PIPELINE_NUMBER=$(echo "${CAND_LINE}" | awk '{print $2}')
+                  BEST_PIPELINE_TRIGGER=$(echo "${CAND_LINE}" | awk '{print $3}')
+                  log "Selected source pipeline candidate: ${BEST_PIPELINE_ID} (number=${BEST_PIPELINE_NUMBER}, trigger=${BEST_PIPELINE_TRIGGER})"
+                  break
+                fi
+
+                NEXT_PAGE_TOKEN=$(echo "${PIPELINES_JSON}" | jq -r '.next_page_token // empty')
+                if [ -z "${NEXT_PAGE_TOKEN}" ]; then
+                  break
+                fi
+                PAGE=$((PAGE + 1))
+              done
+
+              if [ -z "${BEST_PIPELINE_ID}" ]; then
+                log "Error: Could not find pipeline for version ${TARGET_VERSION}"
                 exit 1
               fi
+
+              PIPELINE_ID="${BEST_PIPELINE_ID}"
+              log "Found pipeline ID: ${PIPELINE_ID}"
+              echo "${PIPELINE_ID}" > "${DEBUG_DIR}/pipeline-id.txt"
 
               if [ -z "${PIPELINE_ID}" ]; then
                 log "Error: Could not find pipeline for commit ${TARGET_VERSION}"
