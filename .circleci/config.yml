@@ -172,6 +172,22 @@ jobs:
     steps:
       - checkout
       - run:
+          name: Dump pipeline.deploy values (verification)
+          command: |
+            # NOTE: pipeline values は config コンパイル時に埋め込まれるため、ジョブ実行時のenvとは別物
+            mkdir -p promotion-debug
+            {
+              echo "pipeline.id=<< pipeline.id >>"
+              echo "pipeline.number=<< pipeline.number >>"
+              echo "pipeline.trigger_source=<< pipeline.trigger_source >>"
+              echo "pipeline.deploy.environment_name=<< pipeline.deploy.environment_name >>"
+              echo "pipeline.deploy.component_name=<< pipeline.deploy.component_name >>"
+              echo "pipeline.deploy.namespace=<< pipeline.deploy.namespace >>"
+              echo "pipeline.deploy.target_version=<< pipeline.deploy.target_version >>"
+              echo "pipeline.deploy.current_version=<< pipeline.deploy.current_version >>"
+              echo "pipeline.deploy.reason=<< pipeline.deploy.reason >>"
+            } | tee promotion-debug/pipeline-deploy-values.txt
+      - run:
           name: Download artifact for target version
           command: |
             # このstepは「失敗しても後続の store_artifacts を実行する」ため、最後に必ず exit 0 する。
