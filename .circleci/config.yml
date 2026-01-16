@@ -4,6 +4,9 @@ parameters:
   deploy_type:
     type: string
     default: "regular"
+  target_version:
+    type: string
+    default: ""
 
 orbs:
   node: circleci/node@7.0.0
@@ -155,9 +158,13 @@ jobs:
           command: |
             set -euo pipefail
 
+            # pipeline.deploy.target_versionを優先し、空の場合はパラメータのtarget_versionを使用
             TARGET_VERSION="<< pipeline.deploy.target_version >>"
-            if [ -z "${TARGET_VERSION}" ]; then
-              echo "Error: pipeline.deploy.target_version is empty. Cannot determine promoted version safely."
+            if [ -z "${TARGET_VERSION}" ] || [ "${TARGET_VERSION}" = "" ]; then
+              TARGET_VERSION="<< pipeline.parameters.target_version >>"
+            fi
+            if [ -z "${TARGET_VERSION}" ] || [ "${TARGET_VERSION}" = "" ]; then
+              echo "Error: target_version is empty. Cannot determine promoted version safely."
               exit 1
             fi
             echo "Promoting version: ${TARGET_VERSION}"
@@ -312,8 +319,7 @@ workflows:
               ignore: gh-pages
   build-and-deploy:
     when:
-      not:
-        equal: [ promote, << pipeline.parameters.deploy_type >> ]
+      equal: [ "", << pipeline.parameters.target_version >> ]
     jobs:
       - build:
           filters:
@@ -327,7 +333,8 @@ workflows:
               only: main
   promote:
     when:
-      equal: [ promote, << pipeline.parameters.deploy_type >> ]
+      not:
+        equal: [ "", << pipeline.parameters.target_version >> ]
     jobs:
       - promote-production
 
