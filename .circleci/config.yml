@@ -4,12 +4,6 @@ parameters:
   deploy_type:
     type: string
     default: "regular"
-  target_version:
-    type: string
-    default: ""
-  target_pipeline_number:
-    type: integer
-    default: 0
 
 orbs:
   node: circleci/node@7.0.0
@@ -162,6 +156,10 @@ jobs:
             set -euo pipefail
 
             TARGET_VERSION="<< pipeline.deploy.target_version >>"
+            if [ -z "${TARGET_VERSION}" ]; then
+              echo "Error: pipeline.deploy.target_version is empty. Cannot determine promoted version safely."
+              exit 1
+            fi
             echo "Promoting version: ${TARGET_VERSION}"
 
             # CIRCLE_PROJECT_SLUGを構築（GitHubの場合はgh/org/repo形式）
@@ -189,15 +187,13 @@ jobs:
                 ]
                 | sort_by(.num)
                 | reverse
-                | map(select(.trig != "api")) + map(select(.trig == "api"))
-                | if length > 0 then "\(. [0].id) \(. [0].num) \(. [0].trig)" else "" end
+                | (map(select(.trig != "api")) + map(select(.trig == "api")))
+                | if length > 0 then .[0].id else "" end
               ')
 
               if [ -n "${CAND_LINE}" ]; then
                 PIPELINE_ID=$(echo "${CAND_LINE}" | awk '{print $1}')
-                PIPELINE_NUM=$(echo "${CAND_LINE}" | awk '{print $2}')
-                PIPELINE_TRIG=$(echo "${CAND_LINE}" | awk '{print $3}')
-                echo "Selected source pipeline: ${PIPELINE_ID} (number=${PIPELINE_NUM}, trigger=${PIPELINE_TRIG})"
+                echo "Selected source pipeline: ${PIPELINE_ID}"
                 break
               fi
 
@@ -214,40 +210,38 @@ jobs:
             fi
             echo "Found pipeline ID: ${PIPELINE_ID}"
 
-              # ワークフローIDを取得（build-and-deploy を明示的に選ぶ）
-              WORKFLOW_API="https://circleci.com/api/v2/pipeline/${PIPELINE_ID}/workflow"
-              WORKFLOW_ID=$(curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${WORKFLOW_API}" \
-                | jq -r '.items[]? | select(.name == "build-and-deploy") | .id' | head -1)
+            # ワークフローIDを取得（build-and-deploy を明示的に選ぶ）
+            WORKFLOW_API="https://circleci.com/api/v2/pipeline/${PIPELINE_ID}/workflow"
+            WORKFLOW_ID=$(curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${WORKFLOW_API}" \
+              | jq -r '.items[]? | select(.name == "build-and-deploy") | .id' | head -1)
 
-              if [ -z "${WORKFLOW_ID}" ]; then
-                log "Error: Could not find workflow build-and-deploy for pipeline ${PIPELINE_ID}"
-                exit 1
-              fi
-              log "Found workflow ID: ${WORKFLOW_ID}"
-              echo "${WORKFLOW_ID}" > "${DEBUG_DIR}/workflow-id.txt"
+            if [ -z "${WORKFLOW_ID}" ]; then
+              echo "Error: Could not find workflow build-and-deploy for pipeline ${PIPELINE_ID}"
+              exit 1
+            fi
+            echo "Found workflow ID: ${WORKFLOW_ID}"
 
-              # ビルドジョブの番号を取得（build を明示的に選ぶ）
-              JOB_API="https://circleci.com/api/v2/workflow/${WORKFLOW_ID}/job"
-              BUILD_NUM=$(curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${JOB_API}" \
-                | jq -r '.items[]? | select(.name == "build") | .job_number' | head -1)
+            # ビルドジョブの番号を取得（build を明示的に選ぶ）
+            JOB_API="https://circleci.com/api/v2/workflow/${WORKFLOW_ID}/job"
+            BUILD_NUM=$(curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${JOB_API}" \
+              | jq -r '.items[]? | select(.name == "build") | .job_number' | head -1)
 
-              if [ -z "${BUILD_NUM}" ]; then
-                log "Error: Could not find build job in workflow ${WORKFLOW_ID}"
-                exit 1
-              fi
-              log "Found build job number: ${BUILD_NUM}"
-              echo "${BUILD_NUM}" > "${DEBUG_DIR}/build-job-number.txt"
+            if [ -z "${BUILD_NUM}" ]; then
+              echo "Error: Could not find build job in workflow ${WORKFLOW_ID}"
+              exit 1
+            fi
+            echo "Found build job number: ${BUILD_NUM}"
 
-              # アーティファクトをダウンロード
-              ARTIFACTS_URL="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/${BUILD_NUM}/artifacts"
-              echo "Fetching artifacts from: ${ARTIFACTS_URL}"
-              ARTIFACTS_JSON=$(curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${ARTIFACTS_URL}")
+            # アーティファクトをダウンロード
+            ARTIFACTS_URL="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/${BUILD_NUM}/artifacts"
+            echo "Fetching artifacts from: ${ARTIFACTS_URL}"
+            ARTIFACTS_JSON=$(curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${ARTIFACTS_URL}")
 
-              # アーティファクトファイルを探す（固定名 artifact.zip を優先）
-              ARTIFACT_URL=$(echo "${ARTIFACTS_JSON}" | jq -r '
-                ( .items[]? | select(.path | test("artifact\\.zip$")) | .url ),
-                ( .items[]? | select(.path | test("artifact-.*\\.zip$")) | .url )
-              ' | head -1)
+            # アーティファクトファイルを探す（固定名 artifact.zip を優先）
+            ARTIFACT_URL=$(echo "${ARTIFACTS_JSON}" | jq -r '
+              ( .items[]? | select(.path | test("artifact\\.zip$")) | .url ),
+              ( .items[]? | select(.path | test("artifact-.*\\.zip$")) | .url )
+            ' | head -1)
 
             # 見つからない場合は、artifactsディレクトリから構築
             if [ -z "${ARTIFACT_URL}" ] || [ "${ARTIFACT_URL}" = "null" ]; then
@@ -262,14 +256,14 @@ jobs:
               fi
             fi
 
-              echo "Downloading artifact from: ${ARTIFACT_URL}"
-              curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" -o artifact.zip "${ARTIFACT_URL}"
+            echo "Downloading artifact from: ${ARTIFACT_URL}"
+            curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" -o artifact.zip "${ARTIFACT_URL}"
 
-              test -s artifact.zip
-              mkdir -p dist
-              unzip -o artifact.zip -d dist
-              echo "${TARGET_VERSION}" > version.txt
-              echo "Downloaded and extracted artifact OK"
+            test -s artifact.zip
+            mkdir -p dist
+            unzip -o artifact.zip -d dist
+            echo "${TARGET_VERSION}" > version.txt
+            echo "Downloaded and extracted artifact OK"
       - run:
           name: Plan deployment
           command: |
