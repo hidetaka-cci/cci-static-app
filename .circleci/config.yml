@@ -306,8 +306,7 @@ workflows:
             branches:
               ignore: gh-pages
   build-and-deploy:
-    when:
-      equal: [ "", << pipeline.deploy.target_version >> ]
+    when: (pipeline.deploy.target_version or "") == ""
     jobs:
       - build:
           filters:
@@ -320,9 +319,7 @@ workflows:
             branches:
               only: main
   promote:
-    when:
-      not:
-        equal: [ "", << pipeline.deploy.target_version >> ]
+    when: (pipeline.deploy.target_version or "") != ""
     jobs:
       - promote-production
 
