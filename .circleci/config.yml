@@ -20,7 +20,6 @@ jobs:
           command: |
             VERSION=${CIRCLE_SHA1:0:7}
             echo "Building version: ${VERSION}"
-            # .nojekyllファイルをdistにコピー（存在する場合）
             if [ -f .nojekyll ]; then
               cp .nojekyll dist/
             fi
@@ -28,8 +27,6 @@ jobs:
             zip -r ../artifact-${VERSION}.zip .
             cd ..
             echo ${VERSION} > version.txt
-            # store_artifacts は glob をサポートしないため、アップロード対象をディレクトリに集約する
-            # 参照: https://discuss.circleci.com/t/does-store-artifacts-support-glob/44304
             mkdir -p artifacts
             cp "artifact-${VERSION}.zip" "artifacts/artifact-${VERSION}.zip"
             cp "artifact-${VERSION}.zip" "artifacts/artifact.zip"
@@ -66,7 +63,6 @@ jobs:
       - run:
           name: Extract artifact from workspace
           command: |
-            # workspaceからアーティファクトファイルを探す
             ARTIFACT_FILE=$(ls artifacts/artifact.zip 2>/dev/null | head -1)
             if [ -z "${ARTIFACT_FILE}" ]; then
               ARTIFACT_FILE=$(ls artifact.zip 2>/dev/null | head -1)
@@ -74,21 +70,18 @@ jobs:
             if [ -z "${ARTIFACT_FILE}" ]; then
               ARTIFACT_FILE=$(ls artifact-*.zip 2>/dev/null | head -1)
             fi
-            
+
             if [ -z "${ARTIFACT_FILE}" ]; then
               echo "Error: Could not find artifact file in workspace"
               exit 1
             fi
-            
+
             echo "Found artifact file: ${ARTIFACT_FILE}"
-            
-            # distディレクトリが既に存在する場合は削除
+
             if [ -d dist ]; then
               rm -rf dist
             fi
             mkdir -p dist
-            
-            # アーティファクトを展開
             unzip "${ARTIFACT_FILE}" -d dist
       - run:
           name: Plan deployment
@@ -104,10 +97,9 @@ jobs:
           command: |
             git config --global user.email "circleci-bot@example.com"
             git config --global user.name "circleci-bot"
-            
+
             git clone --depth 1 --branch gh-pages https://${GITHUB_TOKEN}@github.com/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}.git /tmp/gh-pages
             cd /tmp/gh-pages
-            # .git 以外を完全に置き換える（ドットファイルも含めて消す）
             find . -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
             cp -r ~/project/dist/* .
             if [ -f ~/project/.nojekyll ]; then
@@ -118,13 +110,11 @@ jobs:
             git push origin gh-pages
       - run:
           name: Update deployment status
-          command: |
-            circleci run release update production-deploy --status=SUCCESS
+          command: circleci run release update production-deploy --status=SUCCESS
           when: on_success
       - run:
           name: Update deployment status (failure)
-          command: |
-            circleci run release update production-deploy --status=FAILED
+          command: circleci run release update production-deploy --status=FAILED
           when: on_fail
 
   type-check:
@@ -139,165 +129,6 @@ jobs:
           name: Type check
           command: npx tsc --noEmit
 
-  promote-production:
-    docker:
-      - image: cimg/node:20.0
-    resource_class: small
-    steps:
-      - checkout
-      - run:
-          name: Download artifact for promoted version
-          command: |
-            set -euo pipefail
-
-            TARGET_VERSION="<< pipeline.deploy.target_version >>"
-            if [ -z "${TARGET_VERSION}" ]; then
-              echo "Error: pipeline.deploy.target_version is empty. Cannot determine promoted version safely."
-              exit 1
-            fi
-            echo "Promoting version: ${TARGET_VERSION}"
-
-            # CIRCLE_PROJECT_SLUGを構築（GitHubの場合はgh/org/repo形式）
-            CIRCLE_PROJECT_SLUG="gh/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
-
-            # promote 対象 version から「その成果物を作った build pipeline」を探す
-            # promotion pipeline自身(api)を除外し、webhook 起動を優先する
-            NEXT_PAGE_TOKEN=""
-            PAGE=0
-            PIPELINE_ID=""
-            while [ -z "${PIPELINE_ID}" ] && [ "${PAGE}" -lt 25 ]; do
-              if [ -n "${NEXT_PAGE_TOKEN}" ]; then
-                PIPELINE_API="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/pipeline?page-token=${NEXT_PAGE_TOKEN}"
-              else
-                PIPELINE_API="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/pipeline"
-              fi
-              echo "Fetching pipelines from: ${PIPELINE_API}"
-              PIPELINES_JSON=$(curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${PIPELINE_API}")
-
-              CAND_LINE=$(echo "${PIPELINES_JSON}" | jq -r --arg tv "${TARGET_VERSION}" --arg cur "${CIRCLE_PIPELINE_ID:-}" '
-                def sha: (.vcs.revision // .trigger_parameters.github_app.commit_sha // .trigger_parameters.git.checkout_sha // "");
-                [ .items[]?
-                  | select((sha | startswith($tv)) and (.id != $cur))
-                  | {id: .id, num: (.number // -1), trig:(.trigger.type // "")}
-                ]
-                | sort_by(.num)
-                | reverse
-                | (map(select(.trig != "api")) + map(select(.trig == "api")))
-                | if length > 0 then .[0].id else "" end
-              ')
-
-              if [ -n "${CAND_LINE}" ]; then
-                PIPELINE_ID=$(echo "${CAND_LINE}" | awk '{print $1}')
-                echo "Selected source pipeline: ${PIPELINE_ID}"
-                break
-              fi
-
-              NEXT_PAGE_TOKEN=$(echo "${PIPELINES_JSON}" | jq -r '.next_page_token // empty')
-              if [ -z "${NEXT_PAGE_TOKEN}" ]; then
-                break
-              fi
-              PAGE=$((PAGE + 1))
-            done
-
-            if [ -z "${PIPELINE_ID}" ]; then
-              echo "Error: Could not find source pipeline for version ${TARGET_VERSION}"
-              exit 1
-            fi
-            echo "Found pipeline ID: ${PIPELINE_ID}"
-
-            # ワークフローIDを取得（build-and-deploy を明示的に選ぶ）
-            WORKFLOW_API="https://circleci.com/api/v2/pipeline/${PIPELINE_ID}/workflow"
-            WORKFLOW_ID=$(curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${WORKFLOW_API}" \
-              | jq -r '.items[]? | select(.name == "build-and-deploy") | .id' | head -1)
-
-            if [ -z "${WORKFLOW_ID}" ]; then
-              echo "Error: Could not find workflow build-and-deploy for pipeline ${PIPELINE_ID}"
-              exit 1
-            fi
-            echo "Found workflow ID: ${WORKFLOW_ID}"
-
-            # ビルドジョブの番号を取得（build を明示的に選ぶ）
-            JOB_API="https://circleci.com/api/v2/workflow/${WORKFLOW_ID}/job"
-            BUILD_NUM=$(curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${JOB_API}" \
-              | jq -r '.items[]? | select(.name == "build") | .job_number' | head -1)
-
-            if [ -z "${BUILD_NUM}" ]; then
-              echo "Error: Could not find build job in workflow ${WORKFLOW_ID}"
-              exit 1
-            fi
-            echo "Found build job number: ${BUILD_NUM}"
-
-            # アーティファクトをダウンロード
-            ARTIFACTS_URL="https://circleci.com/api/v2/project/${CIRCLE_PROJECT_SLUG}/${BUILD_NUM}/artifacts"
-            echo "Fetching artifacts from: ${ARTIFACTS_URL}"
-            ARTIFACTS_JSON=$(curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" "${ARTIFACTS_URL}")
-
-            # アーティファクトファイルを探す（固定名 artifact.zip を優先）
-            ARTIFACT_URL=$(echo "${ARTIFACTS_JSON}" | jq -r '
-              ( .items[]? | select(.path | test("artifact\\.zip$")) | .url ),
-              ( .items[]? | select(.path | test("artifact-.*\\.zip$")) | .url )
-            ' | head -1)
-
-            # 見つからない場合は、artifactsディレクトリから構築
-            if [ -z "${ARTIFACT_URL}" ] || [ "${ARTIFACT_URL}" = "null" ]; then
-              ARTIFACTS_DIR_URL=$(echo "${ARTIFACTS_JSON}" | jq -r '.items[]? | select(.path == "artifacts") | .url' | head -1)
-              if [ -n "${ARTIFACTS_DIR_URL}" ] && [ "${ARTIFACTS_DIR_URL}" != "null" ]; then
-                # build側で artifacts/artifact.zip を常に作るので、まずは固定名を優先する
-                ARTIFACT_URL="${ARTIFACTS_DIR_URL}/artifact.zip"
-              else
-                echo "Error: Could not find artifact in response"
-                echo "Response: ${ARTIFACTS_JSON}"
-                exit 1
-              fi
-            fi
-
-            echo "Downloading artifact from: ${ARTIFACT_URL}"
-            curl -fsSL -H "Circle-Token: ${CIRCLE_TOKEN}" -o artifact.zip "${ARTIFACT_URL}"
-
-            test -s artifact.zip
-            mkdir -p dist
-            unzip -o artifact.zip -d dist
-            echo "${TARGET_VERSION}" > version.txt
-            echo "Downloaded and extracted artifact OK"
-      - run:
-          name: Plan deployment
-          command: |
-            VERSION=$(cat version.txt)
-            circleci run release plan production-deploy \
-              --environment-name=production \
-              --component-name=cci-static-app \
-              --target-version=${VERSION} \
-              --namespace=default
-      - run:
-          name: Deploy to GitHub Pages
-          command: |
-            git config --global user.email "circleci-bot@example.com"
-            git config --global user.name "circleci-bot"
-            
-            git clone --depth 1 --branch gh-pages https://${GITHUB_TOKEN}@github.com/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}.git /tmp/gh-pages
-            cd /tmp/gh-pages
-            # promote-production（Artifact Promotion/ロールバック）では、gh-pages の内容をアーティファクトの内容に確実に一致させたい。
-            # `.git` 以外を完全に置き換える（ドットファイルも含めて消す）
-            find . -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
-            cp -r ~/project/dist/* .
-            if [ -f ~/project/.nojekyll ]; then
-              cp ~/project/.nojekyll .
-            fi
-            git add -A
-            # 差分が無くても push を発生させ、GitHub Pages のデプロイトリガー/整合性を担保する
-            git commit --allow-empty -m "Deploy version $(cat ~/project/version.txt) from CircleCI [skip ci]"
-            git push origin gh-pages
-      - run:
-          name: Update deployment status
-          command: |
-            circleci run release update production-deploy --status=SUCCESS || true
-          when: on_success
-      - run:
-          name: Update deployment status (failure)
-          command: |
-            circleci run release update production-deploy --status=FAILED || true
-          when: on_fail
-
 workflows:
   test:
     jobs:
@@ -305,8 +136,8 @@ workflows:
           filters:
             branches:
               ignore: gh-pages
+
   build-and-deploy:
-    when: (pipeline.deploy.target_version or "") == ""
     jobs:
       - build:
           filters:
@@ -318,8 +149,3 @@ workflows:
           filters:
             branches:
               only: main
-  promote:
-    when: (pipeline.deploy.target_version or "") != ""
-    jobs:
-      - promote-production
-
